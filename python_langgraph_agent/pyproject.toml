@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "python-social-media-agent"
+version = "0.1.0"
+description = "Python conversion of the social media agent."
+authors = ["Jules <agent@example.com>"]
+readme = "README.md" # This will be a new README inside python_langgraph_agent
+
+[tool.poetry.dependencies]
+python = "^3.10" # Aligning with common Langchain practices, can be >=3.11 if preferred
+langgraph = ">=0.0.57" # Specify a recent version
+langchain = ">=0.1.0"
+langchain-anthropic = ">=0.1.0"
+langchain-google-vertexai = ">=0.1.0"
+firecrawl-py = "*" # For Firecrawl web scraping
+# supabase = ">=2.0.0" # Official supabase-py
+supabase = ">=2.4.0" # More recent version of supabase-py
+python-dotenv = ">=1.0.0"
+streamlit = ">=1.30.0"
+tweepy = ">=4.10.0"
+requests = ">=2.30.0"
+langchain-community = ">=0.0.30" # For various tools and integrations
+fastapi = ">=0.110.0" # For potential auth callback server
+uvicorn = ">=0.29.0" # For running FastAPI
+# For LinkedIn, we'll likely use requests for OAuth and API calls.
+# A dedicated, well-maintained LinkedIn library for Python is not as common.
+beautifulsoup4 = ">=4.12.0" # For parsing HTML if Firecrawl API is direct
+playwright = ">=1.40.0" # For browser automation, as seen in original langgraph.json dockerfile_lines
+langchain-arcade = "*" # For ArcadeAI integration
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
+ruff = ">=0.1.0"
+# Adding types for libraries that might need them for better linting/type checking
+types-requests = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
