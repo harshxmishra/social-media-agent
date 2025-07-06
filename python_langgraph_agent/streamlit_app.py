@@ -111,38 +111,66 @@ async def run_graph_async_logic(input_state: GeneratePostState, config: dict):
     """
     Runs the LangGraph graph using astream and updates session_state.
     This function itself does not call st.experimental_rerun().
+    It expects run_in_progress to be set to True by the caller.
     """
-    st.session_state.run_in_progress = True
+    # st.session_state.run_in_progress = True # Caller now handles setting this to True
     st.session_state.interrupt_data = None # Clear previous interrupt before new run/resume
     st.session_state.error_message = None  # Clear previous error
 
+    # Accumulate state updates locally for this run to determine final state if graph completes
+    # This is a workaround until proper checkpointing state retrieval is implemented
+    current_accumulated_state_dict = input_state.model_dump()
+
     try:
         async for event_part in generate_post_graph.astream(input_state, config=config, stream_mode="updates"):
-            for node_name, output in event_part.items():
+            for node_name, output_delta in event_part.items(): # output_delta contains changes from this node
                 log_entry = f"Event from Node: **{node_name}**"
                 st.session_state.log_messages.append(log_entry)
-                if isinstance(output, dict):
-                    output_summary = {k: (str(v)[:100] + '...' if isinstance(v, str) and len(v) > 100 else v) for k, v in output.items()}
-                    st.session_state.log_messages.append(f"```json\nOutput: {output_summary}\n```")
-                else:
-                    st.session_state.log_messages.append(f"Output: {str(output)[:200]}")
+                if isinstance(output_delta, dict):
+                    current_accumulated_state_dict.update(output_delta) # Merge delta into our accumulated state
+                    output_summary = {k: (str(v)[:100] + '...' if isinstance(v, str) and len(v) > 100 else v) for k, v in output_delta.items()}
+                    st.session_state.log_messages.append(f"```json\nOutput Delta: {output_summary}\n```")
+                else: # Should not happen with StateGraph and Pydantic state if nodes return dicts
+                    st.session_state.log_messages.append(f"Output: {str(output_delta)[:200]}")
 
-                # Persist the latest full state if possible (or relevant parts for resume)
-                # If the event contains the full state object for the node, we can store it.
-                # For "updates" mode, `output` is the delta. The full state is managed by the checkpointer.
-                # If not using a checkpointer that `astream` can use to give us full state,
-                # we might need to manually accumulate state or get it from the interrupt.
-                # For now, we rely on interrupt data or final output.
-                # Let's assume `st.session_state.current_graph_input_state` is the one to be updated for resume.
-                # This is complex without proper checkpointing.
-                # The `input_state` for the *next* call to astream should be the one from the interrupt.
-                # The `human_node_placeholder` includes current_post_content in its interrupt_data.
-                # `auth_socials_passthrough` includes pending_arcade_auth_info.
+                # Update st.session_state.current_graph_input_state with the accumulated state
+                # so that if an interrupt happens *after* this node, the resume logic has the most recent full state.
+                # This is crucial if not using a robust checkpointer that handles state recovery.
+                st.session_state.current_graph_input_state = GeneratePostState(**current_accumulated_state_dict)
 
-        st.session_state.log_messages.append("Graph run completed successfully.")
-        # st.session_state.final_graph_output = ... # Extract from last event if needed
+        # If loop completes without Interrupt, it means graph ENDed
+        st.session_state.log_messages.append("Graph run completed successfully (reached END).")
+
+        # With a checkpointer, get the definitive final state
+        final_checkpoint = generate_post_graph.get_state(config) # config contains thread_id
+        if final_checkpoint:
+            final_state_obj = final_checkpoint.values # .values is the actual state object (e.g., GeneratePostState instance)
+            st.session_state.final_graph_output = {
+                "status": "Completed",
+                "post": final_state_obj.post,
+                "complexPost": final_state_obj.complexPost.model_dump() if final_state_obj.complexPost else None,
+                "image": final_state_obj.image.model_dump() if final_state_obj.image else None,
+                "report": final_state_obj.report,
+                "links": final_state_obj.links,
+                "scheduleDate": str(final_state_obj.scheduleDate) if final_state_obj.scheduleDate else None,
+                # Optionally include the full state for debugging in the UI
+                # "full_state_dump": final_state_obj.model_dump()
+            }
+        else:
+            # Fallback if get_state returns None (should not happen if graph ended cleanly with checkpointer)
+            st.session_state.log_messages.append("WARN: Could not retrieve final state from checkpointer. Using accumulated state.")
+            final_state_obj_fallback = GeneratePostState(**current_accumulated_state_dict)
+            st.session_state.final_graph_output = {
+                "status": "Completed (fallback state)",
+                "post": final_state_obj_fallback.post,
+                # ... (populate other fields as above) ...
+            }
+
 
     except Interrupt as e:
+        # When an interrupt occurs, the state might not be fully checkpointed for the current node's partial work.
+        # The st.session_state.current_graph_input_state (updated after each event part)
+        # is important for the UI to show the most recent data before interruption.
         st.session_state.log_messages.append(f"--- GRAPH INTERRUPTED: {e.data.get('title', 'Unknown Interrupt')} ---")
         st.session_state.interrupt_data = e.data
         # Store the state at point of interruption if not using checkpointer that handles it automatically
@@ -294,9 +322,19 @@ if st.session_state.run_in_progress:
 
 # Display logs
 if st.session_state.log_messages:
-    with st.expander("Execution Log", expanded=True):
+    # Expand if there's an interrupt, error, or final output to see logs leading to it.
+    # Otherwise, keep it collapsed for a clean UI during initial run or if only logs are present.
+    is_significant_outcome = bool(st.session_state.interrupt_data or st.session_state.final_graph_output or st.session_state.error_message)
+    # If a run just finished (not in progress anymore) and there was a result/error, expand.
+    # If a run is fresh and in progress (and no significant outcome yet), keep collapsed.
+    log_expanded_default = True if is_significant_outcome and not st.session_state.run_in_progress else False
+    if not st.session_state.log_messages and not is_significant_outcome : # if only "starting..." log and nothing else yet.
+        log_expanded_default = False
+
+
+    with st.expander("Execution Log", expanded=log_expanded_default):
         for msg in st.session_state.log_messages:
-            st.markdown(msg, unsafe_allow_html=True) # Use markdown for potential formatting
+            st.markdown(msg, unsafe_allow_html=True)
 
 # Display interrupt data if any
 if st.session_state.interrupt_data:
@@ -323,17 +361,47 @@ if st.session_state.interrupt_data:
                 st.session_state.resume_auth_button_clicked = True
                 st.experimental_rerun() # Explicitly rerun to process the click at the top
 
+                st.experimental_rerun() # Explicitly rerun to process the click at the top
+
         elif st.session_state.interrupt_data.get("title") == "Human Review Required":
             interrupt_payload = st.session_state.interrupt_data
-            st.markdown(f"**Post Content to Review:**\n```\n{interrupt_payload.get('current_post_content', 'N/A')}\n```")
-            if interrupt_payload.get('image_url') and interrupt_payload.get('image_url') != "No image selected.":
-                st.image(interrupt_payload.get('image_url'), caption="Selected Image Preview")
-            else:
-                st.write("No image selected for this post.")
-            st.write(f"**Links in post context:** {interrupt_payload.get('links_in_post', [])}")
-            st.write(f"**Currently Scheduled:** {interrupt_payload.get('current_schedule_date', 'Not scheduled')}")
 
-            st.markdown("---")
+            st.subheader("📝 Human Review Required")
+            st.markdown("**Please review the generated post and take action:**")
+
+            # Display Post Content
+            post_content_to_display = interrupt_payload.get('current_post_content', 'N/A')
+            if "Main:" in post_content_to_display and "Reply:" in post_content_to_display: # Crude check for complex post
+                parts = post_content_to_display.split("Reply:", 1)
+                main_post_part = parts[0].replace("Main:", "").strip()
+                reply_post_part = parts[1].strip() if len(parts) > 1 else ""
+                with st.container(border=True):
+                    st.markdown("**Main Post Draft:**")
+                    st.markdown(main_post_part) # Render as markdown
+                if reply_post_part:
+                    with st.container(border=True):
+                        st.markdown("**Reply Draft:**")
+                        st.markdown(reply_post_part) # Render as markdown
+            else:
+                with st.container(border=True):
+                    st.markdown("**Post Draft:**")
+                    st.markdown(post_content_to_display) # Render as markdown
+
+            # Display Image
+            image_url_to_display = interrupt_payload.get('image_url')
+            if image_url_to_display and image_url_to_display != "No image selected.":
+                with st.container(border=True):
+                    st.markdown("**Selected Image:**")
+                    st.image(image_url_to_display, caption="Image Preview", use_column_width=True)
+            else:
+                st.info("No image selected for this post.")
+
+            # Display Context
+            with st.expander("Contextual Information", expanded=False):
+                st.write(f"**Original Links Processed:** {interrupt_payload.get('links_in_post', [])}")
+                st.write(f"**Current Schedule Date:** {interrupt_payload.get('current_schedule_date', 'Not scheduled')}")
+
+            st.divider()
             st.markdown("**Choose an action:**")
 
             available_actions = interrupt_payload.get("available_actions", [])
@@ -367,9 +435,38 @@ if st.session_state.interrupt_data:
                 action_col_idx +=1
 
 # Display final output if graph completed
-if st.session_state.final_graph_output: # This will be set when graph completes successfully
-    st.success("Graph Run Completed!")
-    st.json(st.session_state.final_graph_output)
+if st.session_state.final_graph_output:
+    st.success("✅ Graph Run Completed!")
+    output = st.session_state.final_graph_output
+
+    with st.container(border=True):
+        st.subheader("Final Output")
+        if output.get("complexPost"):
+            st.markdown("**Main Post:**")
+            st.markdown(output["complexPost"]["main_post"])
+            if output["complexPost"]["reply_post"]:
+                st.markdown("---")
+                st.markdown("**Reply Post:**")
+                st.markdown(output["complexPost"]["reply_post"])
+        elif output.get("post"):
+            st.markdown("**Generated Post:**")
+            st.markdown(output["post"])
+        else:
+            st.info("No final post content was generated or captured in the output.")
+
+        if output.get("image") and output["image"].get("imageUrl"):
+            st.markdown("---")
+            st.markdown("**Selected Image:**")
+            st.image(output["image"]["imageUrl"], caption=output["image"].get("mimeType", "Image Preview"))
+        else:
+            st.info("No image was selected for the post.")
+
+        if output.get("report"):
+            with st.expander("View Generated Report", expanded=False):
+                st.markdown(output["report"])
+
+        with st.expander("View Full Final State (JSON)", expanded=False):
+            st.json(output) # Show all collected final data
 
 # Display error message if any
 if st.session_state.error_message:

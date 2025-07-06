@@ -241,10 +241,13 @@ graph_builder.add_edge(SCHEDULE_POST_NODE, END)
 
 
 # Compile the graph
+from langgraph.checkpoint.memory import MemorySaver # Import MemorySaver
+memory = MemorySaver() # Instantiate checkpointer
+
 try:
-    generate_post_graph = graph_builder.compile()
-    generate_post_graph.name = "Generate Post Graph (Python)"
-    print("DEBUG: generate_post_graph compiled successfully.")
+    generate_post_graph = graph_builder.compile(checkpointer=memory) # Add checkpointer
+    generate_post_graph.name = "Generate Post Graph (Python with Checkpointing)"
+    print("DEBUG: generate_post_graph compiled successfully with MemorySaver.")
 except GraphRecursionError as e:
     print(f"ERROR: Graph compilation failed due to potential recursion: {e}")
     print("This might be due to MAX_CONDENSE_ATTEMPTS logic or other loops not having a guaranteed exit to END under all conditions.")
